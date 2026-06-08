@@ -143,7 +143,8 @@ const ChatView = (() => {
     const out = {};
     [
       'event', 'stream_seq', 'epoch', 'from_state', 'to_state', 'toState',
-      'tier', 'model', 'routed_tier', 'routed_model', 'routing_source',
+      'tier', 'model', 'provider', 'routed_tier', 'routed_model',
+      'routed_provider', 'routing_source',
       'routing_applied', 'rollout_phase', 'reason', 'tool_name', 'name',
       'tool_use_id', 'message_id', 'sessionKey', 'session_key',
       'input_tokens', 'output_tokens',
@@ -1490,6 +1491,7 @@ const ChatView = (() => {
           configTierSet.add(lower);
           const rawTier = tiers[tier];
           const tierConfig = {
+            provider: typeof rawTier?.provider === 'string' ? rawTier.provider : '',
             model: typeof rawTier?.model === 'string' ? rawTier.model : '',
             supportsImage: rawTier?.supports_image === true,
             imageOnly: rawTier?.image_only === true,
@@ -3374,6 +3376,53 @@ const ChatView = (() => {
     return _modelDisplayName(name);
   }
 
+  function _routerFxProviderKey(provider) {
+    return typeof provider === 'string' ? provider.trim().toLowerCase() : '';
+  }
+
+  function _routerFxVisualKey(displayName, providerKey, fallback) {
+    const modelKey = typeof displayName === 'string' ? displayName.trim().toLowerCase() : '';
+    const fallbackKey = typeof fallback === 'string' ? fallback.trim().toLowerCase() : '';
+    return (providerKey || '') + '|' + (modelKey || fallbackKey);
+  }
+
+  function _routerFxProviderDisplayName(provider) {
+    const key = _routerFxProviderKey(provider);
+    return key ? key.replace(/_/g, '-') : '';
+  }
+
+  function _routerFxDuplicateDisplayNames(entries) {
+    const counts = new Map();
+    Array.from(entries).forEach((entry) => {
+      const displayKey = String(entry.displayName || '').trim().toLowerCase();
+      if (!displayKey) return;
+      counts.set(displayKey, (counts.get(displayKey) || 0) + 1);
+    });
+    const duplicates = new Set();
+    counts.forEach((count, displayKey) => {
+      if (count > 1) duplicates.add(displayKey);
+    });
+    return duplicates;
+  }
+
+  function _routerFxEntryDisplayLabel(entry, duplicateDisplayNames) {
+    const modelLabel = entry.displayName || (entry.model ? _routerFxStripProvider(entry.model) : entry.tiers[0]);
+    const displayKey = String(modelLabel || '').trim().toLowerCase();
+    const needsProvider = displayKey && duplicateDisplayNames && duplicateDisplayNames.has(displayKey);
+    const providerLabel = needsProvider
+      ? _routerFxProviderDisplayName(entry.provider || (entry.providers && entry.providers[0]) || '')
+      : '';
+    return providerLabel ? providerLabel + ' · ' + modelLabel : modelLabel;
+  }
+
+  function _routerFxEntryTitle(entry) {
+    const providers = Array.isArray(entry.providers) ? entry.providers.filter(Boolean) : [];
+    const providerLabel = providers.length ? providers.join(', ') : (entry.provider || '');
+    const modelLabel = entry.model || entry.displayName || entry.label || '';
+    if (providerLabel && modelLabel) return providerLabel + ' · ' + modelLabel;
+    return modelLabel || providerLabel || entry.displayName || entry.key || '';
+  }
+
   function _routerFxRequestKindFromAttachments(attachments) {
     const list = Array.isArray(attachments) ? attachments : [];
     for (const item of list) {
@@ -3392,22 +3441,24 @@ const ChatView = (() => {
     const known = norm ? _routerFxTierConfigs[norm] : null;
     if (known) return known;
     return {
+      provider: '',
       model: norm && _routerFxModels[norm] ? _routerFxModels[norm] : '',
       supportsImage: false,
       imageOnly: false,
     };
   }
 
-  function _routerFxRememberTierDecision(tier, model) {
+  function _routerFxRememberTierDecision(tier, model, provider) {
     if (typeof tier !== 'string' || !tier) return;
     const norm = tier.toLowerCase();
     _routerFxRegisterTier(norm);
-    if (!model) return;
-    const modelName = String(model);
-    _routerFxModels[norm] = modelName;
     const current = _routerFxTierConfigs[norm] || {};
+    const modelName = model ? String(model) : (current.model || '');
+    const providerName = provider ? String(provider) : (current.provider || '');
+    if (modelName) _routerFxModels[norm] = modelName;
     _routerFxTierConfigs[norm] = {
       model: modelName,
+      provider: providerName,
       supportsImage: current.supportsImage === true,
       imageOnly: current.imageOnly === true,
     };
@@ -3430,43 +3481,80 @@ const ChatView = (() => {
   function _routerFxVisualEntries(requestKind, decision) {
     if (_routerFxConfigTiers === null) return [];
     const kind = _routerFxRequestKindFromDecision(decision, requestKind);
-    const byDisplay = new Map();
+    const byVisualKey = new Map();
     _routerFxSlotList.forEach((tier) => {
       if (_routerFxConfigTiers !== null && !_routerFxConfigTiers.has(tier)) return;
       const tierConfig = _routerFxTierConfig(tier);
       if (!_routerFxTierMatchesRequestKind(tierConfig, kind)) return;
       const displayName = tierConfig.model ? _routerFxStripProvider(tierConfig.model) : tier;
-      const key = displayName ? displayName.toLowerCase() : tier;
-      let entry = byDisplay.get(key);
+      const providerKey = _routerFxProviderKey(tierConfig.provider);
+      const key = _routerFxVisualKey(displayName, providerKey, tier);
+      let entry = byVisualKey.get(key);
       if (!entry) {
-        entry = { key, tiers: [], model: tierConfig.model || '', displayName };
-        byDisplay.set(key, entry);
+        entry = {
+          key,
+          provider: tierConfig.provider || '',
+          providerKey,
+          tiers: [],
+          providers: [],
+          model: tierConfig.model || '',
+          displayName,
+        };
+        byVisualKey.set(key, entry);
       }
       entry.tiers.push(tier);
+      if (tierConfig.provider && entry.providers.indexOf(tierConfig.provider) < 0) {
+        entry.providers.push(tierConfig.provider);
+      }
       if (!entry.model && tierConfig.model) entry.model = tierConfig.model;
     });
-    const decisionTier = decision && typeof decision.tier === 'string'
-      ? decision.tier.toLowerCase()
+    const decisionTier = _routerFxNormalizeTier(decision && (decision.tier || decision.routed_tier || ''));
+    const decisionModel = decision && typeof (decision.model || decision.routed_model) === 'string'
+      ? (decision.model || decision.routed_model)
       : '';
-    const decisionModel = decision && typeof decision.model === 'string' ? decision.model : '';
     if (decisionTier && decisionModel) {
       const displayName = _routerFxStripProvider(decisionModel);
-      const key = displayName ? displayName.toLowerCase() : decisionTier;
-      let entry = byDisplay.get(key);
+      const decisionConfig = _routerFxTierConfig(decisionTier);
+      const decisionProvider = decision.provider || decision.routed_provider || '';
+      const decisionProviderKey = _routerFxProviderKey(decisionProvider || decisionConfig.provider);
+      const key = _routerFxVisualKey(displayName, decisionProviderKey, decisionTier);
+      let entry = byVisualKey.get(key);
       if (!entry && _routerFxTierMatchesRequestKind(_routerFxTierConfig(decisionTier), kind)) {
-        entry = { key, tiers: [], model: decisionModel, displayName };
-        byDisplay.set(key, entry);
+        entry = {
+          key,
+          provider: decisionProvider || decisionConfig.provider || '',
+          providerKey: decisionProviderKey,
+          tiers: [],
+          providers: [],
+          model: decisionModel,
+          displayName,
+        };
+        byVisualKey.set(key, entry);
       }
       if (entry) {
         if (entry.tiers.indexOf(decisionTier) < 0) entry.tiers.push(decisionTier);
+        const effectiveDecisionProvider = decisionProvider || decisionConfig.provider || '';
+        if (effectiveDecisionProvider && entry.providers.indexOf(effectiveDecisionProvider) < 0) {
+          entry.providers.push(effectiveDecisionProvider);
+        }
+        if (!entry.provider && effectiveDecisionProvider) {
+          entry.provider = effectiveDecisionProvider;
+          entry.providerKey = _routerFxProviderKey(effectiveDecisionProvider);
+        }
         if (!entry.model) entry.model = decisionModel;
       }
     }
-    return Array.from(byDisplay.values()).map((e) => ({
+    const duplicateDisplayNames = _routerFxDuplicateDisplayNames(byVisualKey.values());
+    return Array.from(byVisualKey.values()).map((e) => ({
       key: e.key,
       tiers: _routerFxSortTiers(e.tiers),
+      provider: e.provider || (Array.isArray(e.providers) ? e.providers[0] : '') || '',
+      providerKey: e.providerKey || _routerFxProviderKey(e.provider || ''),
+      providers: Array.isArray(e.providers) ? e.providers.slice() : [],
       model: e.model,
       displayName: e.displayName || (e.model ? _routerFxStripProvider(e.model) : e.tiers[0]),
+      label: _routerFxEntryDisplayLabel(e, duplicateDisplayNames),
+      title: _routerFxEntryTitle(e),
     }));
   }
 
@@ -3550,19 +3638,28 @@ const ChatView = (() => {
   function _routerFxResolveLayoutSeed(sessionKey, hintTimestamp) {
     return _routerFxResolveSeed(sessionKey, 0, 'layout', hintTimestamp);
   }
-  function _routerFxIdentity(model, tier) {
+  function _routerFxIdentity(model, tier, provider) {
     const modelPart = typeof model === 'string' ? model.trim().toLowerCase() : '';
     const tierPart = _routerFxNormalizeTier(tier);
-    if (!modelPart && !tierPart) return '';
-    return modelPart + '|' + tierPart;
+    const providerPart = typeof provider === 'string' ? provider.trim().toLowerCase() : '';
+    if (!modelPart && !tierPart && !providerPart) return '';
+    return modelPart + '|' + tierPart + '|' + providerPart;
   }
   function _routerFxDecisionIdentity(decision) {
     if (!decision || typeof decision !== 'object') return '';
-    return _routerFxIdentity(decision.model || decision.routed_model || '', decision.tier || decision.routed_tier || '');
+    return _routerFxIdentity(
+      decision.model || decision.routed_model || '',
+      decision.tier || decision.routed_tier || '',
+      decision.provider || decision.routed_provider || '',
+    );
   }
   function _routerFxUsageIdentity(usage) {
     if (!usage || typeof usage !== 'object') return '';
-    return _routerFxIdentity(usage.routed_model || usage.model || '', usage.routed_tier || '');
+    return _routerFxIdentity(
+      usage.routed_model || usage.model || '',
+      usage.routed_tier || '',
+      usage.routed_provider || usage.provider || '',
+    );
   }
   function _routerFxCountUserMessages() {
     if (!_thread) return 0;
@@ -3608,8 +3705,8 @@ const ChatView = (() => {
 
   // Build the visual roster for this turn only. Text requests exclude
   // image-only routes; image requests include only image-capable routes.
-  // Entries are deduped by display model name so provider/thinking/tier
-  // differences do not create extra visual cells.
+  // Entries are keyed by provider plus display model name so a self-hosted
+  // and hosted copy of the same model can appear as distinct candidates.
   function _routerFxRealEntries(decision, requestKind) {
     return _routerFxVisualEntries(requestKind, decision);
   }
@@ -3618,12 +3715,14 @@ const ChatView = (() => {
   // visible model name is a candidate that could actually be called this turn.
   function _routerFxBuildGridCells(realEntries, seedKey) {
     const orderedRealEntries = realEntries.slice().sort((a, b) => (
-      (a.displayName || a.key || '').localeCompare(b.displayName || b.key || '')
+      (a.label || a.displayName || a.key || '').localeCompare(b.label || b.displayName || b.key || '')
     ));
     return orderedRealEntries.map((entry) => ({
       kind: 'real',
       entry,
       displayName: entry.displayName,
+      label: entry.label || entry.displayName,
+      title: entry.title || entry.label || entry.displayName,
     }));
   }
 
@@ -3681,8 +3780,10 @@ const ChatView = (() => {
       const cell = document.createElement('div');
       cell.className = 'router-fx-cell';
       cell.dataset.cellIdx = String(i);
+      const cellLabel = cellInfo.label || cellInfo.displayName || '';
+      const cellTitle = cellInfo.title || cellLabel;
       // title surfaces the full name on hover when a long one is ellipsized.
-      cell.innerHTML = `<span class="nm" title="${_esc(cellInfo.displayName)}">${_esc(cellInfo.displayName)}</span>`;
+      cell.innerHTML = `<span class="nm" title="${_esc(cellTitle)}">${_esc(cellLabel)}</span>`;
       grid.appendChild(cell);
     });
     const selector = document.createElement('div');
@@ -4268,7 +4369,11 @@ const ChatView = (() => {
   function _routerFxLockGrid(wrap, decision) {
     const tier = _routerFxNormalizeTier(decision.tier);
     if (tier) {
-      _routerFxRememberTierDecision(tier, decision.model || '');
+      _routerFxRememberTierDecision(
+        tier,
+        decision.model || '',
+        decision.provider || decision.routed_provider || '',
+      );
     }
     const winnerIdx = _routerFxWinnerCellIndex(wrap, tier);
     if (winnerIdx >= 0) {
@@ -4414,7 +4519,7 @@ const ChatView = (() => {
       _chatDiag('router_decision.skip.no_tier', _chatDiagSummarizePayload(payload));
       return;
     }
-    _routerFxRememberTierDecision(tier, payload.model || '');
+    _routerFxRememberTierDecision(tier, payload.model || '', payload.provider || payload.routed_provider || '');
     const turnIndex = _routerFxCountUserMessages();
     if (_routerFxIsSuppressedForCompactionTurn(turnIndex)) {
       if (_thread) {
@@ -4589,10 +4694,15 @@ const ChatView = (() => {
         && !_routerFxConfigTiers.has(tier)) {
       return null;
     }
-    _routerFxRememberTierDecision(tier, usage.routed_model || usage.model || '');
+    _routerFxRememberTierDecision(
+      tier,
+      usage.routed_model || usage.model || '',
+      usage.routed_provider || usage.provider || '',
+    );
     const decision = {
       tier,
       model: usage.routed_model || usage.model || '',
+      provider: usage.routed_provider || usage.provider || '',
       source: usage.routing_source || 'none',
       confidence: typeof usage.routing_confidence === 'number' ? usage.routing_confidence : 0,
       fallback: usage.routing_source === 'fallback',
@@ -4658,6 +4768,23 @@ const ChatView = (() => {
       _chatDiag('event.text_delta', _chatDiagSummarizePayload(payload));
       _resetStreamIdleTimer();
       _appendDelta(payload.text || '');
+    }));
+
+    // Text snapshot: provider sent a full replacement of assistant text seen so far.
+    _unsubs.push(_rpc.on('session.event.text_snapshot', (payload, meta = {}) => {
+      if (_dropForeignSessionPayload('event.text_snapshot', payload)) return;
+      if (_isStaleEpoch(payload)) {
+        _chatDiag('event.text_snapshot.drop.stale_epoch', _chatDiagSummarizePayload(payload));
+        return;
+      }
+      if (!_acceptStreamSeq(payload)) {
+        _chatDiag('event.text_snapshot.drop.stream_seq', _chatDiagSummarizePayload(payload));
+        return;
+      }
+      if (_dropReplayedLiveWaitEvent(meta, payload, 'event.text_snapshot')) return;
+      _chatDiag('event.text_snapshot', _chatDiagSummarizePayload(payload));
+      _resetStreamIdleTimer();
+      _applyTextSnapshot(payload.text || '');
     }));
 
     // Tool call events (engine emits tool_use_start)
@@ -6053,6 +6180,85 @@ const ChatView = (() => {
     _renderStreamArtifacts();
   }
 
+  function _streamHasToolBoundary() {
+    return _segments.some((seg) => seg && seg.type === 'tool');
+  }
+
+  function _streamRenderedTextRaw(opts = {}) {
+    const excludeActive = !!(opts && opts.excludeActive);
+    return _segments
+      .filter((seg) => seg && seg.type === 'text' && (!excludeActive || seg.el !== _activeTextSeg))
+      .map((seg) => (typeof seg.raw === 'string' ? seg.raw : ''))
+      .join('');
+  }
+
+  function _streamSnapshotOverlapLength(renderedText, snapshotText) {
+    const rendered = typeof renderedText === 'string' ? renderedText : '';
+    const snapshot = typeof snapshotText === 'string' ? snapshotText : '';
+    const max = Math.min(rendered.length, snapshot.length);
+    for (let len = max; len >= 12; len -= 1) {
+      if (rendered.slice(-len) === snapshot.slice(0, len)) return len;
+    }
+    return 0;
+  }
+
+  function _streamDisplayTextForActiveSnapshot(snapshot) {
+    const displaySnapshot = typeof snapshot === 'string' ? snapshot : '';
+    if (!displaySnapshot || !_streamHasToolBoundary()) return displaySnapshot;
+
+    const committedText = _streamRenderedTextRaw({ excludeActive: true });
+    if (committedText && displaySnapshot.startsWith(committedText)) {
+      return displaySnapshot.slice(committedText.length);
+    }
+    if (committedText && committedText.endsWith(displaySnapshot)) return '';
+
+    const renderedText = _streamRenderedTextRaw();
+    if (renderedText && displaySnapshot.startsWith(renderedText)) {
+      return displaySnapshot.slice(renderedText.length);
+    }
+    if (renderedText && renderedText.endsWith(displaySnapshot)) return '';
+
+    const previousDisplay = _streamRaw || '';
+    if (previousDisplay && displaySnapshot.startsWith(previousDisplay)) {
+      return displaySnapshot.slice(previousDisplay.length);
+    }
+    if (previousDisplay && previousDisplay.endsWith(displaySnapshot)) return '';
+    if (displaySnapshot === previousDisplay || displaySnapshot === renderedText) return '';
+
+    const overlap = Math.max(
+      _streamSnapshotOverlapLength(committedText, displaySnapshot),
+      _streamSnapshotOverlapLength(renderedText, displaySnapshot),
+      _streamSnapshotOverlapLength(previousDisplay, displaySnapshot),
+    );
+    if (overlap > 0) return displaySnapshot.slice(overlap);
+    return displaySnapshot;
+  }
+
+  function _applyTextSnapshot(snapshot) {
+    if (_aborted) return;
+    const snapshotText = typeof snapshot === 'string' ? snapshot : '';
+    if (!_isStreaming) _startStreaming();
+    _ensureStreamBubble();
+    _markVisibleStreamEvent('text_snapshot');
+    const displaySnapshot = _streamDisplayTextForActiveSnapshot(snapshotText);
+    _streamRaw = snapshotText;
+    if (!_streamBubble) return;
+    if (!_activeTextSeg || !_activeTextSeg.isConnected) _newTextSegment();
+    _activeTextRaw = displaySnapshot;
+    const lastSeg = _segments[_segments.length - 1];
+    if (lastSeg && lastSeg.type === 'text') lastSeg.raw = displaySnapshot;
+    if (_renderRafId) {
+      cancelAnimationFrame(_renderRafId);
+      _renderRafId = null;
+    }
+    if (_activeTextSeg && !displaySnapshot) {
+      _activeTextSeg.textContent = '';
+    }
+    _renderDirty = true;
+    _flushRender();
+    _renderStreamArtifacts();
+  }
+
   function _reconcileFinalStreamText(finalText) {
     if (!finalText || finalText === _streamRaw) return;
     if (_streamRaw && finalText.startsWith(_streamRaw)) {
@@ -6364,6 +6570,7 @@ const ChatView = (() => {
     return [
       'session.event.state_change',
       'session.event.text_delta',
+      'session.event.text_snapshot',
       'session.event.router_decision',
       'session.event.tool_use_start',
       'session.event.tool_result',

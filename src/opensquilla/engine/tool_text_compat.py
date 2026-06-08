@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 _PLAIN_JSON_TOOL_CALL_RE = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_.:-]*)\s*(\{.*\})\s*$",
@@ -12,6 +13,11 @@ _PLAIN_JSON_TOOL_CALL_RE = re.compile(
 _PLAIN_JSON_TOOL_PREFIX_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_.:-]*)\s*(?=\{)",
 )
+_WRAPPED_TOOL_CALL_RE = re.compile(
+    r"^\s*<\s*tool_call\s*>\s*(\{.*\})\s*</\s*tool_call\s*>\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+_WRAPPED_TOOL_CALL_MARKER_RE = re.compile(r"<\s*tool_call\s*>", re.IGNORECASE)
 _TEXT_PROTOCOL_MARKER_RE = re.compile(
     (
         r"<\s*(?:minimax:tool_call|tool_calls?|tvoe_calls|invoke\b|"
@@ -79,6 +85,27 @@ _TEXT_PROTOCOL_PREFIXES = (
 _MAX_TEXT_PROTOCOL_PREFIX_LEN = max(len(prefix) for prefix in _TEXT_PROTOCOL_PREFIXES)
 
 
+def parse_wrapped_tool_call_text(text: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse a complete ``<tool_call>{...}</tool_call>`` text payload."""
+
+    match = _WRAPPED_TOOL_CALL_RE.match(text)
+    if match is None:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tool_name = payload.get("name")
+    arguments = payload.get("arguments", {})
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return tool_name, arguments
+
+
 def _find_trailing_tool_call_start(text: str, tool_name: str) -> int | None:
     decoder = json.JSONDecoder()
     for match in reversed(list(_PLAIN_JSON_TOOL_PREFIX_RE.finditer(text))):
@@ -101,6 +128,13 @@ def strip_synthetic_tool_call_text(text: str, tool_name: str) -> str:
 
     if not text:
         return text
+
+    wrapped_marker = _WRAPPED_TOOL_CALL_MARKER_RE.search(text)
+    if wrapped_marker is not None:
+        candidate = text[wrapped_marker.start() :]
+        wrapped_call = parse_wrapped_tool_call_text(candidate)
+        if wrapped_call is not None and wrapped_call[0] == tool_name:
+            return text[: wrapped_marker.start()].rstrip()
 
     if "<minimax:tool_call>" in text:
         return ""

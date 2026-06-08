@@ -72,6 +72,9 @@ from opensquilla.provider import (
     TextDeltaEvent as ProviderTextDelta,
 )
 from opensquilla.provider import (
+    TextSnapshotEvent as ProviderTextSnapshot,
+)
+from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
@@ -120,6 +123,7 @@ from .types import (
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
+    TextSnapshotEvent,
     ThinkingLevel,
     ToolCall,
     ToolResult,
@@ -2242,6 +2246,12 @@ class Agent:
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
                                 yield TextDeltaEvent(text=raw_ev.text)
+
+                            elif isinstance(raw_ev, ProviderTextSnapshot):
+                                assistant_text_parts[:] = [raw_ev.text] if raw_ev.text else []
+                                if raw_ev.text:
+                                    attempt_user_visible_emitted = True
+                                yield TextSnapshotEvent(text=raw_ev.text)
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
                                 if not tools_supported_for_call:
@@ -5478,11 +5488,12 @@ class Agent:
                 if isinstance(ev, MetaResult):
                     result = ev
                     continue
-                # Stream nested AgentEvents through (TextDelta, ToolUseStart,
-                # ToolResult). Capture text deltas so we can render the
-                # final assistant text for the transcript / Done event.
-                from opensquilla.engine.types import TextDeltaEvent
-                if isinstance(ev, TextDeltaEvent) and ev.text:
+                # Stream nested AgentEvents through while capturing text so
+                # the final assistant text can populate transcript / Done.
+                from opensquilla.engine.types import TextDeltaEvent, TextSnapshotEvent
+                if isinstance(ev, TextSnapshotEvent):
+                    final_text_parts[:] = [ev.text] if ev.text else []
+                elif isinstance(ev, TextDeltaEvent) and ev.text:
                     final_text_parts.append(ev.text)
                 yield ev
         except Exception as exc:  # noqa: BLE001

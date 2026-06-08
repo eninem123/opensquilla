@@ -8,7 +8,7 @@ from .anthropic import AnthropicProvider
 from .ollama import OllamaProvider
 from .openai import OpenAIProvider
 from .openai_responses import OpenAIResponsesProvider
-from .protocol import LLMProvider, ProviderPlugin, resolve_failover_chain
+from .protocol import LLMProvider, ProviderPlugin
 from .registry import UnknownProviderError, get_provider_spec
 
 
@@ -60,7 +60,7 @@ def _build_provider(cfg: ProviderConfig) -> LLMProvider:
 
     base_url = cfg.base_url or spec.default_base_url
 
-    if not base_url and spec.provider_id in {"azure", "vllm"}:
+    if not base_url and spec.requires_base_url():
         raise ProviderBuildError(_missing_base_url_message(cfg.provider))
 
     match spec.backend:
@@ -173,7 +173,16 @@ class ModelSelector:
         replaces the static fallback chain from ``SelectorConfig``. An
         empty chain raises ``IndexError`` exactly like ``next_fallback``.
         """
-        chain = resolve_failover_chain(primary_failure, self._config, self._plugin)
+        chain: list[ProviderConfig] | None = None
+        if self._plugin is not None and hasattr(self._plugin, "failover_hook"):
+            try:
+                chain = self._plugin.failover_hook(primary_failure)
+            except Exception:
+                chain = None
+        if chain is None:
+            chain = list(self._chain[self._index + 1 :])
+            if not chain:
+                chain = list(self._config.fallbacks)
         if not chain:
             raise IndexError("No fallback chain available")
         self._chain = [self._chain[0], *chain]
@@ -192,6 +201,15 @@ class ModelSelector:
                 proxy=self._chain[0].proxy,
                 provider_routing=self._chain[0].provider_routing,
             )
+
+    def override_primary(
+        self,
+        primary: ProviderConfig,
+        fallbacks: list[ProviderConfig] | None = None,
+    ) -> None:
+        """Replace this selector instance's active chain without mutating shared config."""
+        self._chain = [primary, *(fallbacks or [])]
+        self._index = 0
 
     def sync_primary(self, cfg: ProviderConfig) -> None:
         """Replace the primary provider config for future resolves and clones."""

@@ -156,15 +156,30 @@ class _StubProvider:
 class _StubSelector:
     label: str = "selector"
     overridden_models: list[str] = field(default_factory=list)
+    overridden_primary: list[Any] = field(default_factory=list)
     resolve_returns: Any = None
+    current_provider: str = "anthropic"
     current_model: str = "claude-sonnet-4.5"
 
     @property
     def current_config(self):
-        return SimpleNamespace(model=self.current_model)
+        return SimpleNamespace(
+            provider=self.current_provider,
+            model=self.current_model,
+            api_key="",
+            base_url="",
+            proxy="",
+        )
 
     def override_model(self, model: str) -> None:
         self.overridden_models.append(model)
+        self.current_model = model
+
+    def override_primary(self, primary: Any, fallbacks: list[Any] | None = None) -> None:
+        del fallbacks
+        self.overridden_primary.append(primary)
+        self.current_provider = primary.provider
+        self.current_model = primary.model
 
     def resolve(self):
         return self.resolve_returns
@@ -350,6 +365,39 @@ async def test_case04_squilla_router_fires_overrides_model() -> None:
     # explicit model wins
     assert out.output.resolved_model == "claude-haiku-4.5"
     assert out.output.squilla_router_tier == "premium"
+
+
+@pytest.mark.asyncio
+async def test_case04_routed_provider_wins_over_call_site_model() -> None:
+    selector = _StubSelector("sel4-provider", current_model="inception/mercury-2")
+    routed_provider = _StubProvider("openrouter_routed")
+    selector.resolve_returns = routed_provider
+    executor = _RecordingPipelineExecutor(
+        turn=_make_turn(
+            metadata={
+                "routed_tier": "c2",
+                "routed_model": "z-ai/glm-5.1",
+                "routed_provider": "openrouter",
+            },
+            model="z-ai/glm-5.1",
+        ),
+        provider=_StubProvider("post_pipeline"),
+    )
+    stage = _make_stage(executor=executor)
+    inp = _make_input(
+        cloned_selector=selector,
+        model="claude-haiku-4.5",
+    )
+
+    out = await stage.run(inp)
+
+    assert selector.overridden_models == []
+    assert selector.overridden_primary
+    assert selector.overridden_primary[0].provider == "openrouter"
+    assert selector.overridden_primary[0].model == "z-ai/glm-5.1"
+    assert out.output.resolved_model == "z-ai/glm-5.1"
+    assert out.output.selector_model == "z-ai/glm-5.1"
+    assert out.output.squilla_router_tier == "c2"
 
 
 @pytest.mark.asyncio

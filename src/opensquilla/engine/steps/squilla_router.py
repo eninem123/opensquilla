@@ -459,6 +459,15 @@ def _compute_savings(routed_model: str, tiers: dict) -> dict:
     }
 
 
+def _record_routed_provider(ctx: TurnContext, tiers: dict, tier_name: str) -> None:
+    tier_cfg = tiers.get(tier_name)
+    if not isinstance(tier_cfg, dict):
+        return
+    provider = str(tier_cfg.get("provider") or "").strip().lower()
+    if provider:
+        ctx.metadata["routed_provider"] = provider
+
+
 def _record_thinking_metadata(ctx: TurnContext, router_cfg: object, tier_cfg: dict) -> None:
     if not getattr(router_cfg, "auto_thinking", True):
         return
@@ -957,6 +966,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ctx.model = decision.model
         ctx.metadata["routed_tier"] = decision.tier
         ctx.metadata["routed_model"] = decision.model
+        _record_routed_provider(ctx, tiers, decision.tier)
         ctx.metadata["routing_applied"] = routing_applied
         ctx.metadata["rollout_phase"] = rollout_phase
         ctx.metadata["applied_model"] = ctx.model
@@ -986,6 +996,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ctx.model = decision.model
             ctx.metadata["routed_tier"] = decision.tier
             ctx.metadata["routed_model"] = decision.model
+            _record_routed_provider(ctx, tiers, decision.tier)
             ctx.metadata["routing_applied"] = True
             ctx.metadata["applied_model"] = ctx.model
             ctx.metadata["routing_confidence"] = decision.confidence
@@ -1145,6 +1156,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         ctx.model = decision.model
     ctx.metadata["routed_tier"] = decision.tier
     ctx.metadata["routed_model"] = decision.model
+    _record_routed_provider(ctx, tiers, decision.tier)
     ctx.metadata["routing_applied"] = routing_applied
     ctx.metadata["rollout_phase"] = rollout_phase
     ctx.metadata["applied_model"] = ctx.model

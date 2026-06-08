@@ -193,6 +193,49 @@ async def test_squilla_router_applies_hold_before_normal_classification(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_squilla_router_records_routed_provider_from_tier(monkeypatch) -> None:
+    class _Strategy:
+        async def classify(self, *_args, **_kwargs):
+            return "c2", 0.91, "test_strategy", {}
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router._get_strategy",
+        lambda _cfg: _Strategy(),
+    )
+    cfg = _router_cfg(
+        {
+            "c1": {
+                "provider": "inception",
+                "model": "inception/mercury-2",
+                "supports_image": False,
+            },
+            "c2": {
+                "provider": "openrouter",
+                "model": "z-ai/glm-5.1",
+                "supports_image": False,
+            },
+        }
+    )
+    ctx = TurnContext(
+        message="hard reasoning question",
+        session_key="agent:main:test-provider-route",
+        config=SimpleNamespace(squilla_router=cfg),
+        provider=None,
+        model="inception/mercury-2",
+        tool_defs=[],
+        system_prompt="system",
+        metadata={},
+    )
+
+    out = await apply_squilla_router(ctx)
+
+    assert out.model == "z-ai/glm-5.1"
+    assert out.metadata["routed_tier"] == "c2"
+    assert out.metadata["routed_model"] == "z-ai/glm-5.1"
+    assert out.metadata["routed_provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
 async def test_image_attachments_bypass_text_hold(monkeypatch) -> None:
     cfg = _router_cfg(_router_tier_profile_defaults("openrouter"))
     target = resolve_router_control_target(cfg, "tier:c3")
@@ -229,7 +272,12 @@ def test_prompt_block_contains_canonical_targets_not_aliases() -> None:
 
     assert "router_control" in block
     assert "tier:c3" in block
+    assert '"target_id":"tier:c0","label":"deepseek-v4-flash"' in block
+    assert '"target_id":"tier:c1","label":"deepseek-v4-pro"' in block
+    assert '"target_id":"tier:c2","label":"glm-5.1"' in block
     assert "tier:t3" not in block
     assert "model:anthropic/claude-opus-4.7" not in block
     assert "description" not in block
+    assert "thinking_level" not in block
+    assert "Use labels only to map explicit model-name requests" in block
     assert "must choose one target_id exactly" in block

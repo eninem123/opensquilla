@@ -2008,11 +2008,10 @@ def test_router_fx_uses_only_effective_real_candidates() -> None:
     assert "return _routerFxShuffle(cells, seedKey);" not in builder_body
 
 
-def test_router_fx_cells_render_plain_model_names_only() -> None:
+def test_router_fx_cells_render_model_labels_without_roster_metadata() -> None:
     # The panel intentionally shows the real candidates for this request. Cells
-    # show only the user-facing model name: no S/M/L/XL, no provider labels, no
-    # thinking badges, and no DOM roster metadata beyond the cell index needed
-    # for the selector.
+    # show the user-facing model label: no S/M/L/XL, no thinking badges, and no
+    # DOM roster metadata beyond the cell index needed for the selector.
     source = CHAT_JS.read_text(encoding="utf-8")
     css = CHAT_CSS.read_text(encoding="utf-8")
 
@@ -2033,6 +2032,33 @@ def test_router_fx_cells_render_plain_model_names_only() -> None:
     assert "cell.dataset.cellIdx = String(i);" in source
     assert "cell.dataset.provider" not in source
     assert "cell.dataset.thinking" not in source
+    assert "_routerFxEntryDisplayLabel(entry, duplicateDisplayNames)" in source
+    assert "cellInfo.label" in source
+
+
+def test_router_fx_distinguishes_same_display_model_by_provider() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    visual_start = source.index("function _routerFxVisualEntries(requestKind, decision) {")
+    visual_end = source.index("  function _routerFxHasMultipleCandidates", visual_start)
+    visual_body = source[visual_start:visual_end]
+
+    assert "function _routerFxProviderKey(provider)" in source
+    assert "function _routerFxVisualKey(displayName, providerKey, fallback)" in source
+    assert "function _routerFxProviderDisplayName(provider)" in source
+    assert "function _routerFxEntryDisplayLabel(entry, duplicateDisplayNames)" in source
+    assert "const providerKey = _routerFxProviderKey(tierConfig.provider);" in visual_body
+    assert "const key = _routerFxVisualKey(displayName, providerKey, tier);" in visual_body
+    assert (
+        "const decisionProviderKey = _routerFxProviderKey("
+        "decisionProvider || decisionConfig.provider);"
+        in visual_body
+    )
+    assert (
+        "const duplicateDisplayNames = _routerFxDuplicateDisplayNames(byVisualKey.values());"
+        in visual_body
+    )
+    assert "label: _routerFxEntryDisplayLabel(e, duplicateDisplayNames)," in visual_body
+    assert "const key = displayName ? displayName.toLowerCase() : tier;" not in visual_body
     for size_label in (">S<", ">M<", ">L<", ">XL<"):
         assert size_label not in source
 
@@ -2802,8 +2828,12 @@ def test_router_fx_render_gated_in_both_live_and_history_paths() -> None:
     )
     assert pre_gate in handler_body
     assert post_gate in handler_body
-    assert handler_body.index("_routerFxRememberTierDecision(tier, payload.model || '');") < \
-        handler_body.index(pre_gate)
+    remember_call = (
+        "_routerFxRememberTierDecision("
+        "tier, payload.model || '', payload.provider || payload.routed_provider || ''"
+        ")"
+    )
+    assert handler_body.index(remember_call) < handler_body.index(pre_gate)
     assert handler_body.index(pre_gate) < \
         handler_body.index("await _routerFxAwaitConfig();")
     # Re-checked AFTER the await as well — the user may flip OFF during the

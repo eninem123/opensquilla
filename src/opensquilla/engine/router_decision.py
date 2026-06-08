@@ -66,6 +66,7 @@ def build_router_decision_event(turn: TurnContext) -> RouterDecisionEvent | None
         tier=str(routed_tier),
         tier_index=tier_idx,
         model=str(turn.metadata.get("routed_model") or turn.model or ""),
+        provider=str(turn.metadata.get("routed_provider") or ""),
         baseline_model=str(turn.metadata.get("baseline_model") or ""),
         source=source,
         confidence=float(turn.metadata.get("routing_confidence") or 0.0),

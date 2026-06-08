@@ -217,6 +217,68 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
     assert rows[0].model_id == "deepseek/deepseek-v4-flash"
 
 
+def test_self_hosted_list_models_reads_common_metadata_fields_without_blank_auth(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_get_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "local-model",
+                        "name": "Local Model",
+                        "max_model_len": 32768,
+                        "max_completion_tokens": 2048,
+                        "supported_parameters": ["tools"],
+                    }
+                ]
+            },
+            request=httpx.Request("GET", "http://localhost:8008/v1/models"),
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="",
+        model="local-model",
+        base_url="http://localhost:8008/v1",
+        provider_kind="self_hosted_openai",
+    )
+
+    rows = asyncio.run(provider.list_models())
+
+    assert captured["url"] == "http://localhost:8008/v1/models"
+    assert "authorization" not in captured["headers"]
+    assert rows[0].provider == "self_hosted_openai"
+    assert rows[0].model_id == "local-model"
+    assert rows[0].context_window == 32768
+    assert rows[0].max_output_tokens == 2048
+    assert rows[0].supports_tools is True
+
+
+def test_self_hosted_openai_payload_omits_blank_auth_and_stream_options(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="",
+        model="local-model",
+        base_url="http://localhost:8008/v1",
+        provider_kind="self_hosted_openai",
+    )
+
+    _collect(provider, ChatConfig(max_tokens=32, temperature=0))
+
+    assert captured["payload"]["model"] == "local-model"
+    assert captured["payload"]["max_tokens"] == 32
+    assert captured["payload"]["temperature"] == 0
+    assert "stream_options" not in captured["payload"]
+    assert "authorization" not in captured["headers"]
+
+
 def test_openrouter_http_error_names_provider_request(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport_response(
@@ -1261,6 +1323,87 @@ def test_openai_compat_sends_named_function_tool_choice_when_configured(
     _collect_events(provider, ChatConfig(tool_choice=tool_choice), tools=[tool])
 
     assert captured["payload"]["tool_choice"] == tool_choice
+
+
+def test_openai_compat_synthesizes_wrapped_tool_call_text(monkeypatch: Any) -> None:
+    chunks = [
+        {
+            "model": "local-model",
+            "choices": [
+                {
+                    "delta": {
+                        "content": (
+                            '<tool_call>{"name":"lookup","arguments":{"q":"hi"}}</tool_call>'
+                        )
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "model": "local-model",
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+        },
+    ]
+    body = b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks)
+    captured: dict[str, Any] = {}
+    _patch_transport_body(monkeypatch, captured, body + b"data: [DONE]\n\n")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="local-model",
+        base_url="http://localhost:8008/v1",
+        provider_kind="self_hosted_openai",
+    )
+    tool = ToolDefinition(
+        name="lookup",
+        description="Lookup a value.",
+        input_schema=ToolInputSchema(properties={"q": {"type": "string"}}, required=["q"]),
+    )
+
+    events = _collect_events(provider, ChatConfig(), tools=[tool])
+
+    tool_end = next(event for event in events if isinstance(event, ToolUseEndEvent))
+    assert tool_end.tool_name == "lookup"
+    assert tool_end.arguments == {"q": "hi"}
+    assert tool_end.synthetic_from_text is True
+
+
+def test_openai_compat_does_not_synthesize_unoffered_wrapped_tool_call_text(
+    monkeypatch: Any,
+) -> None:
+    chunks = [
+        {
+            "model": "local-model",
+            "choices": [
+                {
+                    "delta": {
+                        "content": ('<tool_call>{"name":"not_allowed","arguments":{}}</tool_call>')
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {"model": "local-model", "choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    body = b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks)
+    captured: dict[str, Any] = {}
+    _patch_transport_body(monkeypatch, captured, body + b"data: [DONE]\n\n")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="local-model",
+        base_url="http://localhost:8008/v1",
+        provider_kind="self_hosted_openai",
+    )
+    tool = ToolDefinition(
+        name="lookup",
+        description="Lookup a value.",
+        input_schema=ToolInputSchema(properties={"q": {"type": "string"}}, required=["q"]),
+    )
+
+    events = _collect_events(provider, ChatConfig(), tools=[tool])
+
+    assert not any(isinstance(event, ToolUseEndEvent) for event in events)
 
 
 def test_gemini_stream_multiple_tool_calls_without_indexes_stay_separate(

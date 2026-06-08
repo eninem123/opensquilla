@@ -65,6 +65,12 @@ class TextDeltaEvent:
 
 
 @dataclass
+class TextSnapshotEvent:
+    kind: Literal["text_snapshot"] = field(default="text_snapshot", init=False)
+    text: str = ""
+
+
+@dataclass
 class RunHeartbeatEvent:
     kind: Literal["run_heartbeat"] = field(default="run_heartbeat", init=False)
     phase: str = "agent"
@@ -168,6 +174,7 @@ class DoneEvent:
     session_totals: SessionTotalsSnapshot | None = None
     routing_applied: bool = True
     rollout_phase: str = "full"
+    routed_provider: str = ""
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -200,6 +207,7 @@ class RouterDecisionEvent:
     prompt_policy: str = ""
     routing_applied: bool = True
     rollout_phase: str = "full"
+    provider: str = ""
 
 
 @dataclass
@@ -245,6 +253,7 @@ class CompactionOutcome:
 AgentEvent = (
     ThinkingEvent
     | TextDeltaEvent
+    | TextSnapshotEvent
     | RunHeartbeatEvent
     | ToolUseStartEvent
     | ToolResultEvent

@@ -578,6 +578,316 @@ def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _provider_config_from_tier(
+    *,
+    tier_cfg: Mapping[str, Any],
+    provider: str,
+    model: str,
+    current_config: Any,
+) -> Any:
+    from opensquilla.gateway.llm_runtime import (
+        _resolve_provider_routing,
+        provider_base_url_env_name,
+    )
+    from opensquilla.provider.registry import get_provider_spec
+    from opensquilla.provider.selector import ProviderConfig
+
+    provider = provider.strip().lower()
+    spec = get_provider_spec(provider)
+    same_provider = (
+        str(getattr(current_config, "provider", "") or "").strip().lower()
+        == provider
+    )
+    explicit_api_key = str(tier_cfg.get("api_key") or "").strip()
+    api_key_env = "" if explicit_api_key else str(tier_cfg.get("api_key_env") or spec.env_key)
+    api_key = explicit_api_key or (os.environ.get(api_key_env, "") if api_key_env else "")
+    if not api_key and same_provider:
+        api_key = str(getattr(current_config, "api_key", "") or "")
+
+    base_url_env = provider_base_url_env_name(provider)
+    base_url = (
+        os.environ.get(base_url_env, "")
+        or str(tier_cfg.get("base_url") or "").strip()
+        or (str(getattr(current_config, "base_url", "") or "") if same_provider else "")
+        or spec.default_base_url
+    )
+    proxy = (
+        str(tier_cfg.get("proxy") or "").strip()
+        or os.environ.get("OPENSQUILLA_LLM_PROXY", "")
+        or (str(getattr(current_config, "proxy", "") or "") if same_provider else "")
+    )
+    provider_routing = tier_cfg.get("provider_routing", {})
+    if not isinstance(provider_routing, dict):
+        provider_routing = {}
+
+    return ProviderConfig(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
+        provider_routing=_resolve_provider_routing(provider, provider_routing),
+    )
+
+
+def _tier_routed_provider_config(
+    *,
+    config: Any,
+    metadata: Mapping[str, Any],
+    current_config: Any,
+    model: str,
+) -> Any | None:
+    routed_provider = str(metadata.get("routed_provider") or "").strip().lower()
+    routed_model = str(metadata.get("routed_model") or model or "").strip()
+    routed_tier = str(metadata.get("routed_tier") or "").strip()
+    if not routed_provider or not routed_model:
+        return None
+
+    router_cfg = getattr(config, "squilla_router", None)
+    tiers = getattr(router_cfg, "tiers", {}) if router_cfg is not None else {}
+    tier_cfg = tiers.get(routed_tier, {}) if isinstance(tiers, dict) else {}
+    if not isinstance(tier_cfg, dict):
+        tier_cfg = {}
+    return _provider_config_from_tier(
+        tier_cfg=tier_cfg,
+        provider=routed_provider,
+        model=routed_model,
+        current_config=current_config,
+    )
+
+
+def _tier_routed_fallback_configs(
+    *,
+    config: Any,
+    metadata: Mapping[str, Any],
+    current_config: Any,
+) -> list[Any]:
+    routed_tier = normalize_text_tier(metadata.get("routed_tier"))
+    current_index = tier_index(routed_tier)
+    if current_index < 0:
+        return []
+    router_cfg = getattr(config, "squilla_router", None)
+    tiers = getattr(router_cfg, "tiers", {}) if router_cfg is not None else {}
+    if not isinstance(tiers, dict):
+        return []
+    fallbacks: list[Any] = []
+    fallback_tiers: list[tuple[int, str, dict[str, Any]]] = []
+    for tier_name, tier_cfg in tiers.items():
+        if not isinstance(tier_cfg, dict) or tier_cfg.get("image_only", False):
+            continue
+        normalized_tier = normalize_text_tier(tier_name)
+        fallback_index = tier_index(normalized_tier)
+        if normalized_tier is None or fallback_index <= current_index:
+            continue
+        fallback_tiers.append((fallback_index, tier_name, tier_cfg))
+
+    seen: set[tuple[str, str]] = set()
+    for _fallback_index, tier_name, tier_cfg in sorted(fallback_tiers, key=lambda item: item[0]):
+        provider = str(tier_cfg.get("provider") or "").strip().lower()
+        model = str(tier_cfg.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        key = (provider, model)
+        if key in seen:
+            continue
+        seen.add(key)
+        fallbacks.append(
+            _provider_config_from_tier(
+                tier_cfg=tier_cfg,
+                provider=provider,
+                model=model,
+                current_config=current_config,
+            )
+        )
+    return fallbacks
+
+
+def _apply_routed_provider_override(
+    cloned_selector: Any,
+    *,
+    config: Any,
+    metadata: Mapping[str, Any],
+    model: str,
+) -> bool:
+    if cloned_selector is None:
+        return False
+    try:
+        current_config = cloned_selector.current_config
+    except Exception:  # noqa: BLE001 - selector stubs may raise defensively
+        current_config = None
+
+    provider_cfg = _tier_routed_provider_config(
+        config=config,
+        metadata=metadata,
+        current_config=current_config,
+        model=model,
+    )
+    if provider_cfg is not None and hasattr(cloned_selector, "override_primary"):
+        cloned_selector.override_primary(
+            provider_cfg,
+            _tier_routed_fallback_configs(
+                config=config,
+                metadata=metadata,
+                current_config=current_config,
+            ),
+        )
+        return True
+    if model and hasattr(cloned_selector, "override_model"):
+        cloned_selector.override_model(model)
+        return True
+    return False
+
+
+_TOOL_REQUIRED_KEYWORDS = (
+    "检索",
+    "搜索",
+    "查最新",
+    "联网",
+    "调用工具",
+    "使用工具",
+    "web_search",
+    "use tool",
+    "call tool",
+    "search the web",
+)
+
+
+def _tool_support_mode(value: Any) -> str:
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"auto", "on", "off"}:
+        return normalized
+    return "auto"
+
+
+def _turn_requires_tools(
+    *,
+    message: str,
+    metadata: Mapping[str, Any],
+    tool_defs: list[Any],
+) -> bool:
+    if not tool_defs:
+        return False
+    if metadata.get("tool_required") is True:
+        return True
+    tool_choice = metadata.get("tool_choice") or metadata.get("meta_match_tool_choice")
+    if tool_choice == "required":
+        return True
+    if (
+        isinstance(tool_choice, Mapping)
+        and str(tool_choice.get("mode") or "").lower() == "required"
+    ):
+        return True
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    return any(keyword in text for keyword in _TOOL_REQUIRED_KEYWORDS)
+
+
+def _router_tier_supports_tools(
+    *,
+    runner: Any,
+    _tier_name: str,
+    tier_cfg: Mapping[str, Any],
+    current_config: Any,
+) -> bool:
+    mode = _tool_support_mode(tier_cfg.get("tool_support"))
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    provider = str(tier_cfg.get("provider") or "").strip().lower()
+    model = str(tier_cfg.get("model") or "").strip()
+    if not provider or not model:
+        return False
+    model_catalog = getattr(runner, "_model_catalog", None)
+    if model_catalog is None:
+        return True
+    provider_cfg = _provider_config_from_tier(
+        tier_cfg=tier_cfg,
+        provider=provider,
+        model=model,
+        current_config=current_config,
+    )
+    caps = model_catalog.get_capabilities(
+        model,
+        provider_name=getattr(provider_cfg, "provider", provider),
+        base_url=getattr(provider_cfg, "base_url", ""),
+    )
+    return bool(getattr(caps, "supports_tools", True))
+
+
+def _reconcile_tool_required_route(
+    runner: Any,
+    turn: Any,
+    *,
+    message: str,
+    cloned_selector: Any,
+) -> bool:
+    metadata = getattr(turn, "metadata", {}) or {}
+    tool_defs = list(getattr(turn, "tool_defs", []) or [])
+    if not _turn_requires_tools(message=message, metadata=metadata, tool_defs=tool_defs):
+        return False
+    router_cfg = getattr(getattr(runner, "_config", None), "squilla_router", None)
+    tiers = getattr(router_cfg, "tiers", {}) if router_cfg is not None else {}
+    if not isinstance(tiers, dict):
+        return False
+    current_tier = normalize_text_tier(metadata.get("routed_tier"))
+    if current_tier is None:
+        return False
+    current_cfg = tiers.get(current_tier, {})
+    if not isinstance(current_cfg, dict):
+        return False
+    try:
+        current_config = cloned_selector.current_config if cloned_selector is not None else None
+    except Exception:  # noqa: BLE001
+        current_config = None
+    if _router_tier_supports_tools(
+        runner=runner,
+        _tier_name=current_tier,
+        tier_cfg=current_cfg,
+        current_config=current_config,
+    ):
+        return False
+
+    current_index = tier_index(current_tier)
+    candidates: list[tuple[int, str, dict[str, Any]]] = []
+    for name, raw_cfg in tiers.items():
+        if not isinstance(raw_cfg, dict) or raw_cfg.get("image_only", False):
+            continue
+        normalized = normalize_text_tier(name)
+        if normalized is None:
+            continue
+        idx = tier_index(normalized)
+        if idx <= current_index:
+            continue
+        candidates.append((idx, normalized, raw_cfg))
+    for _idx, candidate_tier, candidate_cfg in sorted(candidates, key=lambda item: item[0]):
+        if not _router_tier_supports_tools(
+            runner=runner,
+            _tier_name=candidate_tier,
+            tier_cfg=candidate_cfg,
+            current_config=current_config,
+        ):
+            continue
+        metadata["tool_required_route_upgrade"] = {
+            "from_tier": current_tier,
+            "to_tier": candidate_tier,
+            "reason": "selected_tier_without_tools",
+        }
+        metadata["routed_tier"] = candidate_tier
+        metadata["routed_provider"] = str(candidate_cfg.get("provider") or "").strip().lower()
+        metadata["routed_model"] = str(candidate_cfg.get("model") or "").strip()
+        metadata["routing_source"] = "tool_capability_fallback"
+        turn.model = metadata["routed_model"]
+        return True
+
+    metadata["tool_required_no_tool_route"] = {
+        "tier": current_tier,
+        "reason": "selected_tier_without_tools",
+    }
+    return False
+
+
 def _strip_context_summary_marker(content: str) -> str:
     """Return summary text from a legacy transcript summary marker."""
     if content.startswith(_CONTEXT_SUMMARY_MARKER):
@@ -2158,6 +2468,33 @@ class TurnRunner:
             router_event = build_router_decision_event(turn)
             if router_event is not None:
                 yield router_event
+            if turn.metadata.get("tool_required_no_tool_route"):
+                no_tool_event = ErrorEvent(
+                    message=(
+                        "This turn requires tools, but the selected router tier "
+                        "does not support tool calls and no tool-capable "
+                        "fallback tier is configured."
+                    ),
+                    code="tool_capability_unavailable",
+                )
+                self._emit_turn_event(
+                    "turn_error",
+                    trace_context,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    run_kind=run_kind,
+                    input_mode=input_mode,
+                    seq=3,
+                    payload={
+                        "error_type": "ToolCapabilityUnavailable",
+                        "error_code": no_tool_event.code,
+                        "error_chars": len(no_tool_event.message),
+                    },
+                )
+                await self._persist_turn_error(session_key, no_tool_event)
+                yield no_tool_event
+                return
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -3874,9 +4211,21 @@ class TurnRunner:
             ],
         )
 
-        # Apply routed model back to cloned selector (local, not shared)
+        _reconcile_tool_required_route(
+            self,
+            turn,
+            message=semantic_message or message,
+            cloned_selector=cloned_selector,
+        )
+
+        # Apply routed provider/model back to cloned selector (local, not shared)
         if turn.model and cloned_selector is not None:
-            cloned_selector.override_model(turn.model)
+            _apply_routed_provider_override(
+                cloned_selector,
+                config=self._config,
+                metadata=turn.metadata,
+                model=turn.model,
+            )
             provider = cloned_selector.resolve()
 
         return turn, provider

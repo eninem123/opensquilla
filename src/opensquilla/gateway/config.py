@@ -240,6 +240,7 @@ class LlmProviderConfig(BaseSettings):
     # send provider.order=[name] so the provider is preferred without disabling
     # OpenRouter fallback.
     provider_routing: dict[str, str] = Field(default_factory=dict)
+    tool_support: Literal["auto", "on", "off"] = "auto"
 
     @model_validator(mode="after")
     def _normalize_direct_deepseek_model(self) -> LlmProviderConfig:
@@ -637,6 +638,31 @@ def _merge_tier_dicts(defaults: dict, overrides: object) -> dict:
     return merged
 
 
+def _normalize_tier_tool_supports(tiers: object) -> object:
+    if not isinstance(tiers, dict):
+        return tiers
+    normalized: dict[str, Any] = {}
+    for tier_name, tier in tiers.items():
+        if not isinstance(tier, dict):
+            normalized[tier_name] = tier
+            continue
+        next_tier = dict(tier)
+        if "toolSupport" in next_tier and "tool_support" not in next_tier:
+            next_tier["tool_support"] = next_tier.pop("toolSupport")
+        elif "toolSupport" in next_tier:
+            next_tier.pop("toolSupport", None)
+        if "tool_support" in next_tier:
+            mode = str(next_tier.get("tool_support") or "auto").strip().lower()
+            if mode not in {"auto", "on", "off"}:
+                raise ValueError(
+                    f"squilla_router.tiers.{tier_name}.tool_support must be one of: "
+                    "auto, on, off"
+                )
+            next_tier["tool_support"] = mode
+        normalized[tier_name] = next_tier
+    return normalized
+
+
 def _router_tier_profile_defaults(profile: str | None) -> dict:
     normalized = (profile or "openrouter").strip().lower()
     if normalized not in ROUTER_TIER_PROFILE_IDS:
@@ -955,7 +981,9 @@ class SquillaRouterConfig(BaseSettings):
                 "default_tier"
             )
         if isinstance(values.get("tiers"), dict):
-            values["tiers"] = normalize_tier_mapping(values["tiers"])
+            values["tiers"] = _normalize_tier_tool_supports(
+                normalize_tier_mapping(values["tiers"])
+            )
         profile = values.get("tier_profile")
         if profile is None:
             return values
@@ -972,7 +1000,7 @@ class SquillaRouterConfig(BaseSettings):
         merged = _merge_tier_dicts(defaults, values.get("tiers"))
         next_values = dict(values)
         next_values["tier_profile"] = normalized
-        next_values["tiers"] = merged
+        next_values["tiers"] = _normalize_tier_tool_supports(merged)
         return next_values
 
 

@@ -13,6 +13,7 @@ the stage boundaries are ready to sequence.
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
@@ -65,6 +66,31 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     TurnMemoryCapturePort,
 )
 from opensquilla.session.compaction_lifecycle import normalize_flush_triggers_strict
+
+
+def _normalize_tool_support(value: Any) -> str:
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"on", "off", "auto"}:
+        return normalized
+    return "auto"
+
+
+def _tool_support_mode_for_turn(config: Any, llm_cfg: Any, metadata: dict[str, Any]) -> str:
+    if config is not None and metadata.get("routed_provider"):
+        router_cfg = getattr(config, "squilla_router", None)
+        tiers = getattr(router_cfg, "tiers", {}) if router_cfg is not None else {}
+        routed_tier = str(metadata.get("routed_tier") or "").strip()
+        tier_cfg = tiers.get(routed_tier, {}) if isinstance(tiers, dict) else {}
+        if isinstance(tier_cfg, dict) and "tool_support" in tier_cfg:
+            return _normalize_tool_support(tier_cfg.get("tool_support"))
+        return "auto"
+    return _normalize_tool_support(getattr(llm_cfg, "tool_support", "auto"))
+
+
+def _apply_tool_support_mode(capabilities: Any, mode: str) -> Any:
+    if capabilities is None or mode == "auto":
+        return capabilities
+    return replace(capabilities, supports_tools=(mode == "on"))
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -382,17 +408,40 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
     def __init__(self, runner: TurnRunner) -> None:
         self._runner = runner
 
-    def lookup(self, model_id: str) -> _ResolvedCatalog:
+    def lookup(self, model_id: str, *, turn: Any | None = None) -> _ResolvedCatalog:
         runner = self._runner
         llm_cfg = getattr(runner._config, "llm", None) if runner._config else None
         user_max_tokens = getattr(llm_cfg, "max_tokens", 0)
+        provider_name = getattr(llm_cfg, "provider", "openrouter")
+        base_url = getattr(llm_cfg, "base_url", "")
+        metadata = getattr(turn, "metadata", {}) or {}
+        if runner._config is not None and metadata.get("routed_provider"):
+            try:
+                from opensquilla.engine.runtime import _tier_routed_provider_config
+
+                routed_cfg = _tier_routed_provider_config(
+                    config=runner._config,
+                    metadata=metadata,
+                    current_config=llm_cfg,
+                    model=model_id,
+                )
+            except Exception:  # noqa: BLE001 - catalog scope fallback is non-fatal
+                routed_cfg = None
+            if routed_cfg is not None:
+                provider_name = getattr(routed_cfg, "provider", provider_name)
+                base_url = getattr(routed_cfg, "base_url", base_url)
         if runner._model_catalog is not None:
             max_tokens = runner._model_catalog.resolve_max_tokens(
-                model_id, user_override=user_max_tokens
+                model_id,
+                user_override=user_max_tokens,
+                provider_name=provider_name,
+                base_url=base_url,
             )
-            context_window = runner._model_catalog.resolve_context_window(model_id)
-            provider_name = getattr(llm_cfg, "provider", "openrouter")
-            base_url = getattr(llm_cfg, "base_url", "")
+            context_window = runner._model_catalog.resolve_context_window(
+                model_id,
+                provider_name=provider_name,
+                base_url=base_url,
+            )
             capabilities = runner._model_catalog.get_capabilities(
                 model_id, provider_name=provider_name, base_url=base_url
             )
@@ -400,6 +449,10 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             max_tokens = user_max_tokens if user_max_tokens > 0 else 16384
             context_window = 200_000
             capabilities = None
+        tool_support_mode = _tool_support_mode_for_turn(runner._config, llm_cfg, metadata)
+        capabilities = _apply_tool_support_mode(capabilities, tool_support_mode)
+        if isinstance(metadata, dict):
+            metadata["tool_support"] = tool_support_mode
         return _ResolvedCatalog(
             max_tokens=max_tokens,
             context_window=context_window,

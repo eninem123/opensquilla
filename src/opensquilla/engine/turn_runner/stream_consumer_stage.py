@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         DoneEvent,
         ErrorEvent,
         TextDeltaEvent,
+        TextSnapshotEvent,
         ToolResultEvent,
         ToolUseStartEvent,
         WarningEvent,
@@ -278,6 +279,29 @@ class _TextDeltaHandler:
             state.current_text_parts.append(cleaned_delta)
         return replace(event, text=cleaned_delta)
 
+
+class _TextSnapshotHandler:
+    """Replace the current streamed text with a provider-supplied full snapshot."""
+
+    def handle(
+        self,
+        event: TextSnapshotEvent,
+        state: _StreamState,
+    ) -> TextSnapshotEvent:
+        snapshot = event.text or ""
+        previous_current = "".join(state.current_text_parts)
+        full_text = "".join(state.final_text_parts)
+
+        if previous_current and full_text.endswith(previous_current):
+            prefix = full_text[: -len(previous_current)]
+            state.final_text_parts[:] = [prefix, snapshot] if prefix else [snapshot]
+        else:
+            state.final_text_parts[:] = [snapshot] if snapshot else []
+
+        state.current_text_parts[:] = [snapshot] if snapshot else []
+        return event
+
+
 class _ToolUseStartHandler:
     """Strip synthetic-tool-call text, flush the current text segment, append tool_use segment.
 
@@ -484,6 +508,7 @@ class _DoneHandler:
             routing_applied = True
         rollout_phase = str(metadata.get("rollout_phase") or "full")
         baseline_model = metadata.get("baseline_model", "")
+        routed_provider = str(metadata.get("routed_provider") or "")
         routed_model = metadata.get("routed_model", "") or event.model
         savings_pct = float(metadata.get("savings_pct") or 0.0)
         _max_p = float(metadata.get("savings_max_price_per_m") or 0.0)
@@ -517,6 +542,7 @@ class _DoneHandler:
             routing_confidence=routing_confidence,
             routing_applied=bool(routing_applied),
             rollout_phase=rollout_phase,
+            routed_provider=routed_provider,
             baseline_model=baseline_model,
             routed_model=routed_model,
             savings_pct=savings_pct,
@@ -861,6 +887,7 @@ class StreamConsumerStage:
         self._memory_sync_notify = memory_sync_notify
 
         self._text_delta_handler = _TextDeltaHandler()
+        self._text_snapshot_handler = _TextSnapshotHandler()
         self._tool_use_start_handler = _ToolUseStartHandler()
         self._tool_result_handler = _ToolResultHandler()
         self._artifact_handler = _ArtifactHandler()
@@ -885,6 +912,7 @@ class StreamConsumerStage:
             DoneEvent,
             ErrorEvent,
             TextDeltaEvent,
+            TextSnapshotEvent,
             ToolResultEvent,
             ToolUseStartEvent,
             WarningEvent,
@@ -901,6 +929,8 @@ class StreamConsumerStage:
             extra_yields: list[AgentEvent] = []
             if isinstance(event, TextDeltaEvent):
                 transformed = self._text_delta_handler.handle(event, state)
+            elif isinstance(event, TextSnapshotEvent):
+                transformed = self._text_snapshot_handler.handle(event, state)
             elif isinstance(event, ToolUseStartEvent):
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolResultEvent):

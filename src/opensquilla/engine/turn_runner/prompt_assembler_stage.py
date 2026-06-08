@@ -250,8 +250,8 @@ class PromptAssemblerStageOutput:
       or ``None``.
     - ``request_context_prompt``: the dynamic context for non-cached
       prefix, or ``None``.
-    - ``resolved_model``: the final model id (explicit > pipeline >
-      selector).
+    - ``resolved_model``: the final model id (routed provider turn >
+      explicit > pipeline > selector).
     - ``provider_name``: the provider's name attribute or class name.
     - ``session_id_for_log``: the durable session_id for trace_context.
     - ``trace_context_session_id``: the same value, surfaced explicitly so
@@ -399,13 +399,35 @@ class PromptAssemblerStage:
 
         # 6. Effective runtime message + selector override / fallback wrap
         effective_runtime_message = getattr(turn, "message", inp.runtime_message)
-        if inp.model and inp.cloned_selector is not None:
-            inp.cloned_selector.override_model(inp.model)
-            provider = inp.cloned_selector.resolve()
+        turn_metadata = getattr(turn, "metadata", {}) or {}
         if inp.cloned_selector is not None:
             # Local import to avoid pulling _SelectorFallbackProvider name
             # into the stage's module-top namespace.
-            from opensquilla.engine.runtime import _SelectorFallbackProvider
+            from opensquilla.engine.runtime import (
+                _apply_routed_provider_override,
+                _SelectorFallbackProvider,
+            )
+
+            routed_provider = str(turn_metadata.get("routed_provider") or "").strip()
+            if routed_provider and getattr(turn, "model", ""):
+                _apply_routed_provider_override(
+                    inp.cloned_selector,
+                    config=getattr(turn, "config", None),
+                    metadata=turn_metadata,
+                    model=getattr(turn, "model", "") or "",
+                )
+                provider = inp.cloned_selector.resolve()
+            elif inp.model:
+                inp.cloned_selector.override_model(inp.model)
+                provider = inp.cloned_selector.resolve()
+            elif getattr(turn, "model", ""):
+                _apply_routed_provider_override(
+                    inp.cloned_selector,
+                    config=getattr(turn, "config", None),
+                    metadata=turn_metadata,
+                    model=getattr(turn, "model", "") or "",
+                )
+                provider = inp.cloned_selector.resolve()
 
             provider = _SelectorFallbackProvider(provider, inp.cloned_selector)
 
@@ -431,7 +453,7 @@ class PromptAssemblerStage:
             tool_profile=turn.metadata.get("tool_profile"),
         )
 
-        # 9. Resolve model_id: explicit param > pipeline-routed > selector current
+        # 9. Resolve model_id: routed provider turn > explicit param > pipeline > selector
         selector_model = ""
         if inp.cloned_selector is not None:
             try:
@@ -440,7 +462,11 @@ class PromptAssemblerStage:
                 )
             except Exception:  # noqa: BLE001 - defensive
                 selector_model = ""
-        resolved_model = inp.model or turn.model or selector_model
+        routed_provider = str(turn_metadata.get("routed_provider") or "").strip()
+        if routed_provider and turn.model:
+            resolved_model = turn.model
+        else:
+            resolved_model = inp.model or turn.model or selector_model
         provider_name = (
             getattr(provider, "provider_name", "") or type(provider).__name__
         )
