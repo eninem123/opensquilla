@@ -1799,7 +1799,13 @@ async def build_services(
     resolved_base = llm_runtime.base_url
     proxy = llm_runtime.proxy
     if provider_selector is None:
-        if api_key:
+        from opensquilla.provider.registry import get_provider_spec as get_llm_provider_spec
+
+        provider_spec = get_llm_provider_spec(llm_runtime.provider)
+        has_required_auth = bool(api_key) or not provider_spec.requires_api_key()
+        has_required_base = bool(resolved_base) or not provider_spec.requires_base_url()
+        has_required_model = bool(llm_runtime.model)
+        if has_required_model and has_required_auth and has_required_base:
             from opensquilla.provider.selector import (
                 ModelSelector,
                 ProviderConfig,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .anthropic import AnthropicProvider
 from .ollama import OllamaProvider
@@ -135,6 +135,7 @@ class ModelSelector:
         self._chain: list[ProviderConfig] = [config.primary, *config.fallbacks]
         self._index = 0
         self._plugin = plugin
+        self._use_config_fallbacks_on_chain_exhaustion = True
 
     def resolve(self) -> LLMProvider:
         """Return the current provider (primary on first call)."""
@@ -181,7 +182,7 @@ class ModelSelector:
                 chain = None
         if chain is None:
             chain = list(self._chain[self._index + 1 :])
-            if not chain:
+            if not chain and self._use_config_fallbacks_on_chain_exhaustion:
                 chain = list(self._config.fallbacks)
         if not chain:
             raise IndexError("No fallback chain available")
@@ -210,6 +211,7 @@ class ModelSelector:
         """Replace this selector instance's active chain without mutating shared config."""
         self._chain = [primary, *(fallbacks or [])]
         self._index = 0
+        self._use_config_fallbacks_on_chain_exhaustion = False
 
     def sync_primary(self, cfg: ProviderConfig) -> None:
         """Replace the primary provider config for future resolves and clones."""
@@ -228,6 +230,13 @@ class ModelSelector:
         (override_model, next_fallback) don't affect the original.
         """
         return ModelSelector(self._config, plugin=self._plugin)
+
+    def configured_fallback_configs(self) -> list[ProviderConfig]:
+        """Return independent copies of the selector's configured fallbacks."""
+        return [
+            replace(cfg, provider_routing=dict(cfg.provider_routing))
+            for cfg in self._config.fallbacks
+        ]
 
     async def list_models(self) -> list[dict]:
         """Aggregate models from all configured providers in the chain."""

@@ -41,6 +41,55 @@ def _router_cfg() -> SquillaRouterConfig:
     )
 
 
+async def _run_pipeline_with_configured_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fallbacks: list[ProviderConfig],
+    session_key: str,
+) -> ModelSelector:
+    class _Strategy:
+        async def classify(self, *_args, **_kwargs):
+            return "c1", 0.92, "test_strategy", {}
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router._get_strategy",
+        lambda _cfg: _Strategy(),
+    )
+    config = GatewayConfig()
+    config.squilla_router = _router_cfg()
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="inception",
+                model="inception/mercury-2",
+                api_key="inception-key",
+                base_url="https://api.inceptionlabs.ai/v1",
+            ),
+            fallbacks=fallbacks,
+        )
+    )
+    cloned_selector = selector.clone()
+    runner = TurnRunner(provider_selector=selector, config=config)
+
+    await runner._run_pipeline(
+        message="create an artifact",
+        session_key=session_key,
+        provider=selector.resolve(),
+        cloned_selector=cloned_selector,
+        tool_defs=[],
+        base_prompt="system",
+        attachments=[],
+        semantic_message="create an artifact",
+        tool_context=SimpleNamespace(
+            agent_id="main",
+            workspace_dir="",
+            channel_kind="webchat",
+            channel_id="webchat",
+        ),
+    )
+    return cloned_selector
+
+
 @pytest.mark.asyncio
 async def test_run_pipeline_switches_selector_provider_for_routed_tier(
     monkeypatch: pytest.MonkeyPatch,
@@ -150,6 +199,69 @@ async def test_run_pipeline_adds_stronger_tier_fallbacks_for_mercury_route(
     assert getattr(fallback, "_provider_kind") == "openrouter"
     assert getattr(fallback, "_model") == "z-ai/glm-5.1"
     assert selector.current_config.provider == "inception"
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_appends_configured_fallbacks_after_router_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloned_selector = await _run_pipeline_with_configured_fallbacks(
+        monkeypatch,
+        fallbacks=[
+            ProviderConfig(
+                provider="anthropic",
+                model="claude-sonnet-4.5",
+                api_key="anthropic-key",
+            )
+        ],
+        session_key="agent:main:test-provider-configured-fallback",
+    )
+
+    first = cloned_selector.next_fallback_after_failure(RuntimeError("primary failed"))
+    assert cloned_selector.current_config.provider == "openrouter"
+    assert cloned_selector.current_config.model == "z-ai/glm-5.1"
+    assert getattr(first, "_provider_kind") == "openrouter"
+
+    second = cloned_selector.next_fallback_after_failure(RuntimeError("first failed"))
+    assert cloned_selector.current_config.provider == "openrouter"
+    assert cloned_selector.current_config.model == "anthropic/claude-opus-4.7"
+    assert getattr(second, "_provider_kind") == "openrouter"
+
+    third = cloned_selector.next_fallback_after_failure(RuntimeError("second failed"))
+    assert cloned_selector.current_config.provider == "anthropic"
+    assert cloned_selector.current_config.model == "claude-sonnet-4.5"
+    assert getattr(third, "provider_name") == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_deduplicates_configured_fallbacks_matching_router_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloned_selector = await _run_pipeline_with_configured_fallbacks(
+        monkeypatch,
+        fallbacks=[
+            ProviderConfig(
+                provider="openrouter",
+                model="z-ai/glm-5.1",
+                api_key="configured-openrouter-key",
+                base_url="https://openrouter.ai/api/v1",
+            )
+        ],
+        session_key="agent:main:test-provider-configured-fallback-dedupe",
+    )
+
+    first = cloned_selector.next_fallback_after_failure(RuntimeError("primary failed"))
+    assert cloned_selector.current_config.provider == "openrouter"
+    assert cloned_selector.current_config.model == "z-ai/glm-5.1"
+    assert getattr(first, "_provider_kind") == "openrouter"
+
+    second = cloned_selector.next_fallback_after_failure(RuntimeError("first failed"))
+    assert cloned_selector.current_config.provider == "openrouter"
+    assert cloned_selector.current_config.model == "anthropic/claude-opus-4.7"
+    assert getattr(second, "_provider_kind") == "openrouter"
+
+    with pytest.raises(IndexError, match="No fallback chain available"):
+        cloned_selector.next_fallback_after_failure(RuntimeError("second failed"))
 
 
 @pytest.mark.asyncio

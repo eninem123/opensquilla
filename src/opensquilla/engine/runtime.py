@@ -702,6 +702,31 @@ def _tier_routed_fallback_configs(
     return fallbacks
 
 
+def _provider_config_key(config: Any) -> tuple[str, str, str]:
+    return (
+        str(getattr(config, "provider", "") or "").strip().lower(),
+        str(getattr(config, "model", "") or "").strip(),
+        str(getattr(config, "base_url", "") or "").strip().rstrip("/").lower(),
+    )
+
+
+def _combine_routed_and_configured_fallbacks(
+    *,
+    primary: Any,
+    routed_fallbacks: list[Any],
+    configured_fallbacks: list[Any],
+) -> list[Any]:
+    seen = {_provider_config_key(primary)}
+    combined: list[Any] = []
+    for fallback in [*routed_fallbacks, *configured_fallbacks]:
+        key = _provider_config_key(fallback)
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        combined.append(fallback)
+    return combined
+
+
 def _apply_routed_provider_override(
     cloned_selector: Any,
     *,
@@ -723,12 +748,25 @@ def _apply_routed_provider_override(
         model=model,
     )
     if provider_cfg is not None and hasattr(cloned_selector, "override_primary"):
+        routed_fallbacks = _tier_routed_fallback_configs(
+            config=config,
+            metadata=metadata,
+            current_config=current_config,
+        )
+        configured_fallback_configs = getattr(
+            cloned_selector, "configured_fallback_configs", None
+        )
+        configured_fallbacks = (
+            list(configured_fallback_configs())
+            if callable(configured_fallback_configs)
+            else []
+        )
         cloned_selector.override_primary(
             provider_cfg,
-            _tier_routed_fallback_configs(
-                config=config,
-                metadata=metadata,
-                current_config=current_config,
+            _combine_routed_and_configured_fallbacks(
+                primary=provider_cfg,
+                routed_fallbacks=routed_fallbacks,
+                configured_fallbacks=configured_fallbacks,
             ),
         )
         return True
